@@ -37,6 +37,18 @@
     <string name="btn_roi_undo">撤销</string>
     <string name="btn_roi_clear">清空</string>
 
+    <!-- 2 秒全图巡检：双摄（前后两面同时看）/ 单摄（机型不支持并发，只有当前镜头）/ 关闭 -->
+    <string name="btn_inspect_dual">巡检 双</string>
+    <string name="btn_inspect_single">巡检 单</string>
+    <string name="btn_inspect_off">巡检 关</string>
+    <string name="hint_inspect_dual">已开启 2 秒巡检：前后两路摄像头同时看，人绕到背面也会响</string>
+    <string name="hint_inspect_single">已开启 2 秒巡检：本机不支持前后双摄并发，只用当前镜头的最广视野巡检</string>
+    <string name="hint_inspect_off">已关闭 2 秒巡检，只判定当前取景范围</string>
+
+    <!-- 数字裁切（双指缩放）提示 -->
+    <string name="hint_crop_on">数字裁切 %1$s×：只裁送进模型的画面，没有切换物理镜头</string>
+    <string name="hint_crop_off">已复位数字裁切</string>
+
     <string name="hint_roi_on">已在 %1$d 个选区内放大识别，区域外不判定</string>
     <string name="hint_roi_off">已取消选区，恢复全画面检测</string>
     <string name="hint_roi_added">选区已保存</string>

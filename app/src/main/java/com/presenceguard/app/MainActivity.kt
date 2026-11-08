@@ -11,6 +11,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.Toast
@@ -43,6 +44,15 @@ class MainActivity : AppCompatActivity() {
     private var metricTick = 0
     private var cachedSensitivity = Sensitivity.MEDIUM
     private var rois: List<Roi> = emptyList()
+
+    /** 「数字裁切」这件事只提示一次，别每帧弹 */
+    private var cropHintShown = false
+
+    /** 最近一次巡检的人话结论，挂在指标行第二行 */
+    private var inspectionLine = ""
+
+    /** 指标行第一行（帧率 / 耗时 / 分值），巡检刷新时不能被覆盖掉 */
+    private var metricsHead = ""
 
     /** 屏幕是否亮着。熄屏时要主动摘掉预览，见 [screenReceiver] 的注释 */
     private var screenOn = true
@@ -114,10 +124,28 @@ class MainActivity : AppCompatActivity() {
 
                 if (++metricTick % 5 == 0 && !dimmed) {
                     val score = String.format(Locale.US, "%.2f", outcome.smoothedScore)
-                    binding.metricsText.text =
+                    metricsHead =
                         "${result.fps.toInt()} fps · ${result.processingMs} ms · 分值 $score · ${outcome.votes}"
-                    binding.metricsText.visibility = View.VISIBLE
+                    renderMetrics()
                 }
+            }
+        }
+
+        /**
+         * 巡检结果。
+         *
+         * 巡检不走 [onFrame]（它不参与主判定，也不 publish），所以指标行不会因为
+         * 巡检自己刷新 —— 这里补一次，否则用户看不到「另一面有没有人」这个信息。
+         */
+        override fun onInspection(present: Boolean, score: Float, source: String) {
+            runOnUiThread {
+                val pct = (score * 100).toInt().coerceIn(0, 100)
+                inspectionLine = if (present) {
+                    "巡检·$source 有人 · 把握 $pct%"
+                } else {
+                    "巡检·$source 无人"
+                }
+                renderMetrics()
             }
         }
 
@@ -330,19 +358,55 @@ class MainActivity : AppCompatActivity() {
             ).show()
         }
 
-        // 暗屏状态下任意触摸即恢复亮度，避免用户找不到退出方式
-        binding.root.setOnTouchListener { _, _ ->
-            if (dimmed) {
-                setDimmed(false)
-                true
-            } else {
-                false
+        // ---------------------------------------------------------- 双指缩放（数字裁切）
+        //
+        // 手势在 OverlayView 里识别（它盖在预览之上，能吃到所有触摸），
+        // 这里只负责把倍率转给服务、刷新按钮文字、并在第一次缩放时提示一次
+        // 「这是数字裁切，不是换镜头」—— 这两件事用户很容易搞混。
+        binding.overlayView.onCropScaleChange = { scale ->
+            service?.setCropScale(scale)
+            if (!cropHintShown && scale > 1.01f) {
+                cropHintShown = true
+                Toast.makeText(
+                    this,
+                    getString(R.string.hint_crop_on, String.format(Locale.US, "%.1f", scale)),
+                    Toast.LENGTH_SHORT
+                ).show()
             }
         }
 
+        // ---------------------------------------------------------- 2 秒全图巡检
+        binding.btnInspect.setOnClickListener {
+            val svc = service ?: return@setOnClickListener
+            val next = !svc.isDualInspect()
+            svc.setDualInspect(next)
+            updateInspectButton()
+            // 并发绑定的结果是异步回来的，这里先按"双摄"报，等状态刷新后按钮会自己纠正成"巡检 单"
+            Toast.makeText(
+                this,
+                if (next) R.string.hint_inspect_dual else R.string.hint_inspect_off,
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+
+        // 暗屏状态下任意触摸即恢复亮度，避免用户找不到退出方式。
+        //
+        // 放在 dispatchTouchEvent 而不是 View.setOnTouchListener：叠加层（OverlayView）
+        // 要实现双指缩放，必须吃掉全部触摸（非编辑模式下一律返回 true），
+        // 挂在根布局上的 listener 在事件被下层消费后根本收不到 —— 那样暗屏就点不回来了。
+        // 在分发之前拦掉，无论谁消费事件都能恢复亮度。
         updateSensitivityButton(cachedSensitivity)
         updateSoundButton(true)
         updateRoiButton()
+        updateInspectButton()
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (dimmed) {
+            setDimmed(false)
+            return true
+        }
+        return super.dispatchTouchEvent(ev)
     }
 
     // ------------------------------------------------------------ 焦段 / 镜头
@@ -380,6 +444,45 @@ class MainActivity : AppCompatActivity() {
         if (count > 1) {
             binding.btnLens.text = getString(R.string.btn_lens_fmt, (svc?.currentLensIndex() ?: 0) + 1)
         }
+    }
+
+    // ------------------------------------------------------------ 指标行
+
+    /**
+     * 指标行。
+     *
+     * 第一行是常规性能数据，第二行是巡检结论。两行分开维护，谁刷新都不会擦掉对方。
+     * 只有**画面不可见**（暗屏 / 息屏）时才不渲染，因为那时候没人看。
+     */
+    private fun renderMetrics() {
+        if (dimmed) return
+        val text = listOf(metricsHead, inspectionLine)
+            .filter { it.isNotEmpty() }
+            .joinToString("\n")
+        if (text.isEmpty()) return
+        binding.metricsText.text = text
+        binding.metricsText.visibility = View.VISIBLE
+    }
+
+    // ------------------------------------------------------------ 双指缩放
+
+    /**
+     * 双指缩放只改数字裁切，和「焦段」按钮的物理变焦是两件事。
+     *
+     * 按钮文字上不混在一起显示：焦段按钮显示相机 zoom（1.0x/2.0x…），
+     * 双指缩放的倍率由 OverlayView 自己在取景框上标出来（"数字 2.3× · 框外不识别"）。
+     * 这样用户一眼就能分清"我拉近的是镜头，还是只是裁了一块"。
+     */
+    private fun updateInspectButton() {
+        val svc = service
+        val on = svc?.isDualInspect() ?: true
+        binding.btnInspect.setText(
+            when {
+                !on -> R.string.btn_inspect_off
+                svc?.isConcurrentInspection() == true -> R.string.btn_inspect_dual
+                else -> R.string.btn_inspect_single
+            }
+        )
     }
 
     // ------------------------------------------------------------ 选区
@@ -434,6 +537,9 @@ class MainActivity : AppCompatActivity() {
         updateZoomButton(svc.currentZoom())
         updateLensButton()
         updateRoiButton()
+        updateInspectButton()
+        // 数字裁切是持久化的，重建界面时把倍率和取景框一起还原
+        binding.overlayView.setCropScale(svc.currentCropScale())
         binding.btnTone.text = getString(R.string.btn_tone_fmt, svc.currentTone().displayName)
         binding.btnPause.setText(if (svc.isPaused()) R.string.btn_resume else R.string.btn_pause)
         applyStatus(svc.currentStatus())
@@ -441,6 +547,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyStatus(status: DetectionService.Status? = service?.currentStatus()) {
         val current = status ?: return
+        // 并发双摄是否成功要等相机绑完才知道，状态每次变都可能变，顺手刷一下
+        updateInspectButton()
         when (current.phase) {
             DetectionService.Phase.INITIALIZING -> {
                 binding.statusDot.setBackgroundResource(R.drawable.dot_idle)

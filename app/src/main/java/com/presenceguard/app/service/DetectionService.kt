@@ -20,11 +20,15 @@ import android.util.Size
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ConcurrentCamera
+import androidx.camera.core.ConcurrentCamera.SingleCameraConfig
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCase
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.lifecycle.ExperimentalCameraProviderConfiguration
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -75,6 +79,14 @@ class DetectionService : Service(), LifecycleOwner {
         fun onStatus(status: Status)
 
         fun onError(message: String)
+
+        /**
+         * 巡检结果回调。和 [onFrame] 完全分开，因为巡检**不参与主判定**：
+         * 它只是「另一面 / 更广的视野里有没有人」的一个旁路观察，用来补漏。
+         *
+         * 给默认实现是为了不逼着已有实现类都改一遍。
+         */
+        fun onInspection(present: Boolean, score: Float, source: String) {}
     }
 
     inner class LocalBinder : Binder() {
@@ -100,6 +112,23 @@ class DetectionService : Service(), LifecycleOwner {
     private var previewUseCase: Preview? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    /**
+     * 第二颗摄像头（与当前镜头朝向相反）的巡检分析器。
+     *
+     * 它和 [analyzer] 共用同一套引擎实例 —— 不是省事，是必须：
+     * TFLite 的 Interpreter 不是线程安全的，ML Kit 的检测器也不适合多实例并存。
+     * 两者都挂在同一个单线程 [cameraExecutor] 上，推理天然串行，
+     * 「同时获取」在取流层是真的并发，「同时运算」在推理层是背靠背排队。
+     * 对 2 秒一次的巡检来说这个差别可以忽略，却省掉一整类竞态崩溃。
+     */
+    private var secondEye: FrameAnalyzer? = null
+
+    private var secondAnalysisUseCase: ImageAnalysis? = null
+
+    /** 前后双摄是否真的并发绑上了。多数机型不支持，此时降级为单镜头巡检 */
+    @Volatile
+    private var concurrentActive = false
 
     /**
      * Activity 传入的预览 SurfaceProvider。
@@ -179,16 +208,19 @@ class DetectionService : Service(), LifecycleOwner {
         super.onDestroy()
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
         runCatching { analysisUseCase?.clearAnalyzer() }
+        runCatching { secondAnalysisUseCase?.clearAnalyzer() }
         runCatching { cameraProvider?.unbindAll() }
 
         val engine = poseEngine
         val detector = personEngine
         val analyzerRef = analyzer
+        val secondRef = secondEye
         // 在途帧可能还卡在 ML Kit 回调里，立刻 close 会让它重复完成 Task 而崩溃
         mainHandler.postDelayed({
             runCatching { engine?.close() }
             runCatching { detector?.close() }
             runCatching { analyzerRef?.shutdown() }
+            runCatching { secondRef?.shutdown() }
         }, 600L)
 
         runCatching { alertPlayer.release() }
@@ -309,6 +341,28 @@ class DetectionService : Service(), LifecycleOwner {
         1
     }
 
+    // ------------------------------------------------------------ 双指缩放（数字裁切）
+
+    fun currentCropScale(): Float = settings.cropScale
+
+    /**
+     * 设置数字裁切倍数（双指缩放）。
+     *
+     * 这是**纯软件裁切**：只改送进模型的那块像素，相机参数一律不动，预览画面也不变。
+     * 它和 [setZoomRatio] 是两条完全独立的路：
+     *
+     *  - [setZoomRatio] -> 相机传感器级区域裁切，部分机型自动切长焦，预览同步放大，
+     *    对识别是**真增益**（拿到的是真实像素）。
+     *  - 本方法 -> 从已经采到的帧里裁中心一块送模型，等效加焦距，但像素没有增加。
+     */
+    fun setCropScale(scale: Float) {
+        val next = scale.coerceIn(1f, Settings.MAX_CROP_SCALE)
+        if (next == settings.cropScale) return
+        settings.cropScale = next
+        analyzer?.cropScale = next
+        Log.i(TAG, "cropScale=$next")
+    }
+
     fun currentLensIndex(): Int = lensIndex
 
     /**
@@ -356,6 +410,10 @@ class DetectionService : Service(), LifecycleOwner {
         analyzer?.tilesPerFrame = if (enabled) 0 else tilesForSensitivity(sensitivity)
         // 选区路是「有明确目标」时才开的，省电下保留但减到每帧 1 个
         analyzer?.roiPerFrame = roiBudgetFor(analyzer?.rois?.size ?: 0)
+        // 副摄那条输出流是这一档最大的开销，省电时必须摘掉；主摄巡检保留
+        if (dualEyeEnabled() != (secondAnalysisUseCase != null)) {
+            mainHandler.post { bindCamera() }
+        }
     }
 
     fun isPowerSave(): Boolean = settings.powerSave
@@ -364,10 +422,16 @@ class DetectionService : Service(), LifecycleOwner {
         paused = !paused
         if (paused) {
             analysisUseCase?.clearAnalyzer()
+            secondAnalysisUseCase?.clearAnalyzer()
         } else {
             analyzer?.let { analysisUseCase?.setAnalyzer(cameraExecutor, it) }
+            // 副摄用例可能因为暂停时没建出来，恢复时直接重绑一次最省心
+            if (dualEyeEnabled() && secondEye?.inspectionOnly == true) {
+                mainHandler.post { bindCamera() }
+            }
         }
         fusion.reset()
+        secondEye?.let { runCatching { it.rebind(sensitivity.toConfig(), false) } }
         publishStatus(status.copy(phase = if (paused) Phase.PAUSED else Phase.RUNNING, present = false, personCount = 0))
         return paused
     }
@@ -433,7 +497,20 @@ class DetectionService : Service(), LifecycleOwner {
                     tilesPerFrame = tilesForSensitivity(sensitivity)
                     rois = settings.rois
                     roiPerFrame = roiBudgetFor(settings.rois.size)
+                    cropScale = settings.cropScale
+                    inspectionIntervalMs = if (inspectionEnabled()) INSPECTION_INTERVAL_MS else 0L
+                    onInspectionHit = { present, score -> onInspectionResult(present, score, "主摄") }
                 }
+                // 副摄巡检器：只做整帧粗判，自己的融合状态机，绝不投票给主判定
+                secondEye = FrameAnalyzer(engine, detector, PresenceFusionEngine(), silentListener)
+                    .apply {
+                        config = sensitivity.toConfig()
+                        inspectionOnly = true
+                        inspectionIntervalMs = INSPECTION_INTERVAL_MS
+                        onInspectionHit = { present, score ->
+                            onInspectionResult(present, score, oppositeLensName())
+                        }
+                    }
                 bindCamera()
                 updateStatus(Status(Phase.RUNNING))
             }
@@ -458,21 +535,17 @@ class DetectionService : Service(), LifecycleOwner {
             cameraProvider = provider
             provider.unbindAll()
             camera = null
+            concurrentActive = false
             backInfos = collectBackCameras(provider)
 
-            val resolutionSelector = ResolutionSelector.Builder()
-                .setResolutionStrategy(
-                    ResolutionStrategy(
-                        // 精细路靠瓦片放大视野，但采集本身分辨率太低时，放大的只是模糊块。
-                        // 720p 是 865 上性价比最高的折中。
-                        Size(ANALYSIS_WIDTH, ANALYSIS_HEIGHT),
-                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
-                    )
-                )
-                .build()
+            // unbindAll 只是解绑，分析器还挂在旧用例上；不摘掉的话旧管线会把帧
+            // 继续送进同一个分析器，和新建的用例抢着关 ImageProxy，是必崩的写法。
+            runCatching { analysisUseCase?.clearAnalyzer() }
+            runCatching { secondAnalysisUseCase?.clearAnalyzer() }
+            secondAnalysisUseCase = null
 
             val analysis = ImageAnalysis.Builder()
-                .setResolutionSelector(resolutionSelector)
+                .setResolutionSelector(resolutionSelectorFor(ANALYSIS_WIDTH, ANALYSIS_HEIGHT))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
 
@@ -484,53 +557,159 @@ class DetectionService : Service(), LifecycleOwner {
             analyzerRef.tilesPerFrame = tilesForSensitivity(sensitivity)
             analyzerRef.rois = settings.rois
             analyzerRef.roiPerFrame = roiBudgetFor(settings.rois.size)
+            analyzerRef.cropScale = settings.cropScale
+            analyzerRef.inspectionIntervalMs = if (inspectionEnabled()) INSPECTION_INTERVAL_MS else 0L
 
-            analysisUseCase?.clearAnalyzer()
             analysisUseCase = analysis
-
             if (!paused) analysis.setAnalyzer(cameraExecutor, analyzerRef)
 
-            val useCases = ArrayList<UseCase>(2)
+            var preview: Preview? = null
             if (previewVisible) {
-                val preview = Preview.Builder().build()
+                preview = Preview.Builder().build()
                 previewUseCase = preview
                 // 关键：不接 SurfaceProvider 的话，相机照样开、检测照样跑，但屏幕上永远没画面
                 pendingSurfaceProvider?.let { preview.setSurfaceProvider(it) }
-                useCases += preview
             } else {
                 // 界面不可见：干脆不绑 Preview，省掉整条预览输出流
                 previewUseCase = null
             }
-            useCases += analysis
 
-            var bound = false
-            try {
-                camera = provider.bindToLifecycle(this, selectorFor(lensFacing), *useCases.toTypedArray())
-                bound = true
-            } catch (t: Throwable) {
-                Log.w(TAG, "bind failed, retry with other lens", t)
+            val secondary = buildSecondEye()
+            var bound = bindCameras(provider, analysis, preview, secondary)
+            if (!bound) {
+                Log.w(TAG, "bind failed, retry with other lens")
                 lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
                     CameraSelector.LENS_FACING_FRONT
                 } else {
                     CameraSelector.LENS_FACING_BACK
                 }
-                runCatching {
-                    camera = provider.bindToLifecycle(this, selectorFor(lensFacing), *useCases.toTypedArray())
-                    analyzerRef.mirrored = lensFacing == CameraSelector.LENS_FACING_FRONT
-                    bound = true
-                }.onFailure {
-                    updateStatus(Status(Phase.ERROR, message = "无法打开摄像头"))
-                }
+                analyzerRef.mirrored = lensFacing == CameraSelector.LENS_FACING_FRONT
+                bound = bindCameras(provider, analysis, preview, secondary)
+                if (!bound) updateStatus(Status(Phase.ERROR, message = "无法打开摄像头"))
             }
 
             if (bound) {
                 applyZoom()
                 Log.i(
                     TAG,
-                    "bound facing=$lensFacing lens=$lensIndex/${backInfos.size} preview=$previewVisible"
+                    "bound facing=$lensFacing lens=$lensIndex/${backInfos.size} " +
+                        "preview=$previewVisible dual=$concurrentActive inspect=${inspectionEnabled()}"
                 )
+                // 并发双摄成功与否要等这一刻才知道，推一次状态让界面把按钮文案改对
+                publishStatus(status.copy())
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun resolutionSelectorFor(width: Int, height: Int) = ResolutionSelector.Builder()
+        .setResolutionStrategy(
+            ResolutionStrategy(
+                Size(width, height),
+                // 精细路靠瓦片放大视野，但采集本身分辨率太低时，放大的只是模糊块。
+                // 1080p 是 865 上性价比最高的折中。
+                ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+            )
+        )
+        .build()
+
+    /**
+     * 第二颗摄像头（另一面）的巡检用例。
+     *
+     * 分辨率刻意压到 720p：并发双摄的**流组合**是由相机 HAL 白名单决定的，
+     * 两路都按 1080p 去要，很多机型会直接判定组合不合法而拒绝绑定。
+     * 巡检只判断"那一面有没有人"，720p 足够；换来的是并发成功率更高。
+     */
+    private fun buildSecondEye(): ImageAnalysis? {
+        val eye = secondEye ?: return null
+        if (!dualEyeEnabled() || paused) return null
+
+        val useCase = ImageAnalysis.Builder()
+            .setResolutionSelector(resolutionSelectorFor(INSPECTION_WIDTH, INSPECTION_HEIGHT))
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+        eye.config = sensitivity.toConfig()
+        eye.inspectionIntervalMs = INSPECTION_INTERVAL_MS
+        useCase.setAnalyzer(cameraExecutor, eye)
+        secondAnalysisUseCase = useCase
+        return useCase
+    }
+
+    /**
+     * 绑定相机。优先尝试前后双摄并发，失败则退回单镜头。
+     *
+     * 并发双摄不是"调个开关就有"的东西：CameraX 的 [ProcessCameraProvider.bindToLifecycle]
+     * 接受多组 [SingleCameraConfig]，但底层要求相机 HAL 声明支持
+     * `LOGICAL_MULTI_CAMERA` 的并发流组合。绝大多数中低端机、以及不少旗舰的
+     * 「前+后」组合都会直接抛异常。所以这里的流程是「试 -> 失败就降级」，
+     * 而不是「先探测再决定」——探测一次同样要开相机，成本比试一次还高。
+     */
+    private fun bindCameras(
+        provider: ProcessCameraProvider,
+        analysis: ImageAnalysis,
+        preview: Preview?,
+        secondary: ImageAnalysis?
+    ): Boolean {
+        if (secondary != null) {
+            val attempt = runCatching { bindConcurrent(provider, analysis, preview, secondary) }
+            val concurrent = attempt.getOrNull()
+            // getCameras() 的顺序和传入的 config 顺序一致，第 0 个就是主摄
+            val primary = concurrent?.cameras?.firstOrNull()
+
+            if (primary != null) {
+                concurrentActive = true
+                camera = primary
+                Log.i(TAG, "concurrent bind ok: ${concurrent.cameras.size} cameras")
+                return true
+            }
+
+            concurrentActive = false
+            Log.w(
+                TAG,
+                "concurrent bind unsupported, degrade to single camera: ${attempt.exceptionOrNull()?.message}"
+            )
+            // 并发失败时可能已经绑了一半，先清干净再走单路
+            runCatching { secondAnalysisUseCase?.clearAnalyzer() }
+            secondAnalysisUseCase = null
+            runCatching { provider.unbindAll() }
+            camera = null
+        }
+
+        concurrentActive = false
+        val useCases = ArrayList<UseCase>(2)
+        preview?.let { useCases += it }
+        useCases += analysis
+        return runCatching {
+            camera = provider.bindToLifecycle(
+                this, selectorFor(lensFacing), *useCases.toTypedArray()
+            )
+        }.onFailure { Log.w(TAG, "single bind failed", it) }.isSuccess
+    }
+
+    @androidx.annotation.OptIn(ExperimentalCameraProviderConfiguration::class)
+    private fun bindConcurrent(
+        provider: ProcessCameraProvider,
+        analysis: ImageAnalysis,
+        preview: Preview?,
+        secondary: ImageAnalysis
+    ): ConcurrentCamera {
+        val primaryGroup = UseCaseGroup.Builder().apply {
+            addUseCase(analysis)
+            preview?.let { addUseCase(it) }
+        }.build()
+        val secondaryGroup = UseCaseGroup.Builder().addUseCase(secondary).build()
+
+        val opposite = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
+            CameraSelector.LENS_FACING_FRONT
+        } else {
+            CameraSelector.LENS_FACING_BACK
+        }
+
+        return provider.bindToLifecycle(
+            listOf(
+                SingleCameraConfig(selectorFor(lensFacing), primaryGroup, this),
+                SingleCameraConfig(selectorFor(opposite), secondaryGroup, this)
+            )
+        )
     }
 
     /**
@@ -606,6 +785,66 @@ class DetectionService : Service(), LifecycleOwner {
         override fun onError(message: String) {
             notifyListeners { it.onError(message) }
         }
+    }
+
+    /**
+     * 副摄分析器用的空监听器。
+     *
+     * [FrameAnalyzer.inspectionOnly] 打开后它永远不会 publish，这两个回调只是签名占位。
+     */
+    private val silentListener = object : FrameAnalyzer.Listener {
+        override fun onResult(result: FrameResult, outcome: PresenceFusionEngine.Outcome) = Unit
+        override fun onError(message: String) = Unit
+    }
+
+    // ------------------------------------------------------------ 2 秒巡检
+
+    /** 2 秒一次的全图巡检（含主摄广视野 + 副摄另一面） */
+    private fun inspectionEnabled(): Boolean = settings.dualInspect
+
+    /**
+     * 前后双摄并发巡检。
+     *
+     * 省电模式下只留主摄巡检：多开一条相机输出流是这一个功能里最贵的一笔，
+     * 而 2 秒一次的主摄广视野巡检已经能兜住「人走到侧面」的漏检。
+     */
+    private fun dualEyeEnabled(): Boolean = settings.dualInspect && !settings.powerSave
+
+    /** 副摄在界面上叫什么。它永远对着当前镜头的反面 */
+    private fun oppositeLensName(): String =
+        if (lensFacing == CameraSelector.LENS_FACING_BACK) "前摄" else "后摄"
+
+    fun isDualInspect(): Boolean = settings.dualInspect
+
+    /** 前后双摄是否真的并发上了。false 表示机型不支持，已降级为单镜头巡检 */
+    fun isConcurrentInspection(): Boolean = concurrentActive
+
+    fun setDualInspect(enabled: Boolean) {
+        if (settings.dualInspect == enabled) return
+        settings.dualInspect = enabled
+        analyzer?.inspectionIntervalMs = if (enabled) INSPECTION_INTERVAL_MS else 0L
+        fusion.reset()
+        publishStatus(status.copy())
+        // 副摄用例要不要存在变了，得重绑一次相机
+        mainHandler.post { bindCamera() }
+    }
+
+    /**
+     * 巡检命中处理。
+     *
+     * 巡检结果是「主判定之外的旁路证据」：**绝不**写回 [status] / [fusion]，
+     * 但命中就响 —— 只在主判定已经报警时才响的话，等于什么也没补上。
+     */
+    private fun onInspectionResult(present: Boolean, score: Float, source: String) {
+        notifyListeners { it.onInspection(present, score, source) }
+        if (!present || paused) return
+        if (!settings.audioEnabled) return
+
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastAlertAt < settings.alertIntervalMs) return
+        lastAlertAt = now
+        Log.i(TAG, "inspection hit [$source] score=$score")
+        alertPlayer.play()
     }
 
     private inline fun notifyListeners(block: (Listener) -> Unit) {
@@ -731,6 +970,13 @@ class DetectionService : Service(), LifecycleOwner {
         private const val NOTIFY_REFRESH_MS = 5000L
         /** 省电模式下的分析间隔：5fps 足够判断「有没有人」 */
         private const val POWER_SAVE_FRAME_INTERVAL = 200L
+
+        /** 全图巡检周期。2 秒是「看得见人走过」和「别把 CPU 烧了」之间的折中 */
+        private const val INSPECTION_INTERVAL_MS = 2000L
+
+        /** 副摄巡检流的分辨率。压到 720p 既省转换开销，也提高并发绑定被 HAL 接受的概率 */
+        private const val INSPECTION_WIDTH = 1280
+        private const val INSPECTION_HEIGHT = 720
 
         /** 分析流分辨率。瓦片放大需要足够的原始像素，720p 是折中值 */
         private const val ANALYSIS_WIDTH = 1920

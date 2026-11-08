@@ -758,8 +758,61 @@ adb shell top -n 1 -b -o PID,%CPU,ARGS | grep presenceguard
 | 加检测引擎 | 双引擎 + 概率合成 | 误报大幅下降 |
 | 几何约束修正 | 去掉"双肩水平""髋在肩下"，改旋转不变比例 | 躺/侧身/横屏不再被判死 |
 | 小目标体系 | 瓦片扫描 + 轨迹持久化 + 重平衡折扣 | 远处召回大幅提升 |
-| 选区体系（当前） | 多点多边形 + 选区内放大 + 预览功耗治理 | 精度和帧率同时提升 |
-| v2 计划 | YOLO 640 输入 + 自建 TFLite Interpreter 层 | 目标：广场级小目标 |
+| 选区体系 | 多点多边形 + 选区内放大 + 预览功耗治理 | 精度和帧率同时提升 |
+| 双指缩放 / 巡检（当前） | 数字裁切、选区外零计算、2 秒前后双摄巡检 | 见 15.1 |
+| v2 | YOLO 640 输入 + 自建 TFLite Interpreter 层 | 目标：广场级小目标 |
+
+### 15.1 双指缩放 / 选区外零计算 / 2 秒巡检
+
+这一轮和 v2 同步优化，三项改动在 v1 上的落地方式：
+
+**① 数字裁切（双指缩放）**
+
+`OverlayView` 用 `ScaleGestureDetector` 识别捏合（倍乘而非累加，松手时低于 1.12 吸附回 1），
+把倍率交给 `FrameAnalyzer.cropScale`。真正的裁切由 `YuvCropper` 完成 ——
+直接从 `YUV_420_888` 的 plane buffer 挖中心矩形，逐像素做 BT.601 limited-range
+YUV→ARGB，**矩形外的像素一个都不碰**。
+
+和「焦段」按钮的区别：焦段走 `CameraControl.setZoomRatio()`（传感器级裁切，预览跟着放大），
+数字裁切是纯软件裁切，预览不动，只在画面上画一个虚线框标注「框外不识别」。
+
+实测（1080×1440 源帧）：转换 `cv` 从 28~34ms 降到 **16~20ms**（2.5x 裁切）。
+
+**② 选区外零计算**
+
+原来的选区路线是先 `imageProxy.toBitmap()` 转整帧，再 `Bitmap.createBitmap` 裁选区 ——
+整帧转换的钱已经付过了，选区再小也省不下来。
+
+现在 `analyze()` 先按路线分流，选区模式**完全不生成整帧位图**：
+每块选区单独 `YuvCropper.crop()`，然后 `scanCrop()` 在裁切图上先跑姿态、再跑检测
+（顺序不能换：TFLite 的 MlImage 关闭时会回收传入的位图）。选区面积占整帧超过 6% 时
+再切 2×2 子块轮转，把有效分辨率再提一倍。
+
+实测 `cv` 从 30ms 降到 **3~4ms**。
+
+**③ 2 秒全图巡检**
+
+选区和数字裁切都是「望远镜」。每 2 秒一条旁路退回当前镜头最广视野扫一遍整帧，
+只判「有没有人」，结论进独立的 `inspectionFusion`，**不投票、不 publish**。
+命中就响 —— 只在主判定已经报警时才响的话，等于什么也没补上。
+
+前后双摄并发用 CameraX 1.4 的 `ConcurrentCamera`（`bindToLifecycle(List<SingleCameraConfig>)`）。
+底层要求相机 HAL 声明支持并发流组合，本机（M2007J1SC / 865）明确返回
+`Concurrent camera is not supported on the device`，自动降级为单镜头巡检，
+界面按钮从「巡检 双」变成「巡检 单」。
+
+副摄用的是同一个 `FrameAnalyzer` 类 + `inspectionOnly = true`：只有到点那一帧做整帧粗判，
+其余帧连位图都不转。它和主摄**共用同一套引擎实例**（TFLite Interpreter 不是线程安全的，
+ML Kit 检测器也不适合多实例并存），两者都挂在同一个单线程 `cameraExecutor` 上，推理天然串行。
+
+**④ 底部布局**
+
+指标行和控制栏合进同一个纵向 `LinearLayout`（`bottomDock`），指标自然排在按钮上方。
+原来用 `marginBottom="140dp"` 手动避让，按钮加到第三行就把帧率文字压住了。
+
+连带一个坑：`OverlayView` 要实现双指缩放，非编辑模式下必须吃掉全部触摸，
+于是「暗屏时点一下恢复亮度」挂在 `binding.root.setOnTouchListener` 上收不到事件了 ——
+改到 `Activity.dispatchTouchEvent` 里提前拦截。
 
 ---
 
