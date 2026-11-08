@@ -143,6 +143,35 @@
                 style="@style/ControlButton"
                 android:text="@string/btn_power_off" />
         </LinearLayout>
+
+        <!-- 第三行：焦段 / 镜头 / 选区 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:baselineAligned="false"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/btnZoom"
+                style="@style/ControlButton"
+                android:text="@string/btn_zoom_default" />
+
+            <TextView
+                android:id="@+id/btnLens"
+                style="@style/ControlButton"
+                android:text="@string/btn_lens_default"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/btnRoi"
+                style="@style/ControlButton"
+                android:text="@string/btn_roi" />
+
+            <TextView
+                android:id="@+id/btnRoiUndo"
+                style="@style/ControlButton"
+                android:text="@string/btn_roi_clear" />
+        </LinearLayout>
     </LinearLayout>
 
     <!-- 权限引导 -->

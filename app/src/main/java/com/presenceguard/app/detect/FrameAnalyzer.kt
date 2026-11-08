@@ -3,6 +3,8 @@ package com.presenceguard.app.detect
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.Rect
+import android.graphics.RectF
 import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
@@ -13,11 +15,14 @@ import com.google.mlkit.vision.common.InputImage
 import com.presenceguard.app.core.DetectionConfig
 import com.presenceguard.app.core.FrameResult
 import com.presenceguard.app.core.PersonCandidate
+import com.presenceguard.app.core.Roi
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * CameraX 分析器：双路合成检测。
@@ -64,6 +69,23 @@ class FrameAnalyzer(
     /** 精细路每帧滚几片。0 表示关闭精细路（省电模式）。 */
     @Volatile
     var tilesPerFrame: Int = DEFAULT_TILES_PER_FRAME
+
+    /**
+     * 用户框选的多边形选区。**非空即切换到「选区模式」**：
+     * 判定只在选区内进行，区域外的画面完全不参与推理。
+     */
+    @Volatile
+    var rois: List<Roi> = emptyList()
+
+    /**
+     * 选区模式下每帧扫几个选区。默认 1：一个选区的成本是「裁切 + 检测 + 姿态」两次推理，
+     * 多了帧率会塌。多个选区靠游标轮转覆盖，跨帧轨迹会把证据攒起来。
+     */
+    @Volatile
+    var roiPerFrame: Int = DEFAULT_ROI_PER_FRAME
+
+    /** 选区轮转游标 */
+    private var roiCursor = 0
 
     /** 最近一帧的分段耗时，供界面与日志核对 */
     @Volatile
@@ -137,6 +159,9 @@ class FrameAnalyzer(
         lastConvertMs = SystemClock.elapsedRealtime() - begin
 
         val cfg = config
+        val activeRois = rois
+        val roiMode = activeRois.isNotEmpty()
+
         // RGBA 输出格式下没有 android.media.Image，退回用位图构造（坐标同样是已旋转的）
         val inputImage = if (mediaImage != null) {
             InputImage.fromMediaImage(mediaImage, rotation)
@@ -147,6 +172,14 @@ class FrameAnalyzer(
         val frameWidth = if (rotation % 180 == 0) imageProxy.width else imageProxy.height
         val frameHeight = if (rotation % 180 == 0) imageProxy.height else imageProxy.width
 
+        // 选区模式下 fusion 层要换一套门槛：用户已经用多边形声明了「这块区域值得看」，
+        // 再拿「占整帧面积太小」去卡他，等于把选区这个先验扔掉了。
+        val fusionCfg = if (roiMode) {
+            cfg.copy(minAreaRatio = ROI_MIN_AREA_RATIO, smallTargetAreaRatio = 0f)
+        } else {
+            cfg
+        }
+
         // 镜头被遮挡 / 贴着桌面时，画面几乎是纯色，模型会在这种无纹理图上疯狂误报。
         // 先用平均亮度把这类帧挡掉：既省掉几次推理，也避免「有人」卡死。
         val luma = averageLuma(bitmap)
@@ -154,7 +187,7 @@ class FrameAnalyzer(
             bitmap.recycle()
             imageProxy.close()
             val now = SystemClock.elapsedRealtime()
-            val outcome = fusion.update(emptyList(), emptyList(), frameWidth, frameHeight, now, cfg)
+            val outcome = fusion.update(emptyList(), emptyList(), frameWidth, frameHeight, now, fusionCfg)
             listener.onResult(
                 FrameResult(
                     candidates = emptyList(),
@@ -169,47 +202,80 @@ class FrameAnalyzer(
             return
         }
 
-        val latch = CountDownLatch(if (personEngine == null) 1 else 2)
+        val latch: CountDownLatch
         var poseCandidates: List<PersonCandidate> = emptyList()
         var detectorCandidates: List<PersonCandidate> = emptyList()
         var poseFailed: Throwable? = null
-        var poseStartedAt = 0L
 
-        poseStartedAt = SystemClock.elapsedRealtime()
-        poseEngine.detect(
-            image = inputImage,
-            executor = poseExecutor,
-            onResult = { poses ->
-                poseCandidates = PoseScorer.toCandidates(poses, cfg.keypointThreshold, frameHeight)
-            },
-            onFailure = { poseFailed = it },
-            onComplete = {
-                lastPoseMs = SystemClock.elapsedRealtime() - poseStartedAt
-                latch.countDown()
-            }
-        )
+        if (roiMode) {
+            // ---- 选区模式
+            // 只扫选区，而且两个引擎都在**放大后的裁切图**上跑：
+            //  - 放大：选区外接矩形缩放到模型的 320×320 输入，等于给画面加了一台长焦；
+            //  - 双引擎：放大之后置信度上来了，交叉印证才有意义，能压住「放大后噪点变人」。
+            // 整帧检测在这条路径下完全跳过——用户已经指定了要盯的地方，别的地方不看。
+            latch = CountDownLatch(1)
+            val take = min(roiPerFrame.coerceAtLeast(1), activeRois.size)
+            val start = roiCursor % activeRois.size
+            val selected = (0 until take).map { activeRois[(start + it) % activeRois.size] }
+            roiCursor = (start + take) % activeRois.size
 
-        personEngine?.let { engine ->
-            val grid = tileGrid
-            // 画面里已经有人时不做瓦片扫描：报警已经触发，瓦片的意义是「找人」，
-            // 稳态下省掉这几次推理，帧率能明显提升。空场景才是需要全力搜索的时候。
-            val tiles = if (lastPresent) 0 else tilesPerFrame
             val detectBegin = SystemClock.elapsedRealtime()
             detectExecutor.execute {
                 try {
-                    val collected = ArrayList<PersonCandidate>(tiles + 2)
-                    // 瓦片先跑：整帧推理会让 TFLite 的 MlImage 在关闭时回收底层位图，
-                    // 之后再裁瓦片就会拿到 recycled bitmap。顺序反过来才是安全的。
-                    if (tiles > 0) {
-                        collected += engine.detectTiles(bitmap, grid, tiles)
+                    val poseOut = ArrayList<PersonCandidate>(4)
+                    val detOut = ArrayList<PersonCandidate>(4)
+                    for (roi in selected) {
+                        scanRegion(bitmap, roi, cfg, frameWidth, frameHeight, poseOut, detOut)
                     }
-                    collected += engine.detectFull(bitmap)
-                    detectorCandidates = collected
+                    poseCandidates = poseOut
+                    detectorCandidates = detOut
                 } catch (t: Throwable) {
-                    Log.w(TAG, "detector failed", t)
+                    Log.w(TAG, "roi scan failed", t)
                 } finally {
                     lastDetectMs = SystemClock.elapsedRealtime() - detectBegin
                     latch.countDown()
+                }
+            }
+        } else {
+            // ---- 常规模式：整帧双路合成
+            latch = CountDownLatch(if (personEngine == null) 1 else 2)
+
+            val poseStartedAt = SystemClock.elapsedRealtime()
+            poseEngine.detect(
+                image = inputImage,
+                executor = poseExecutor,
+                onResult = { poses ->
+                    poseCandidates = PoseScorer.toCandidates(poses, cfg.keypointThreshold, frameHeight)
+                },
+                onFailure = { poseFailed = it },
+                onComplete = {
+                    lastPoseMs = SystemClock.elapsedRealtime() - poseStartedAt
+                    latch.countDown()
+                }
+            )
+
+            personEngine?.let { engine ->
+                val grid = tileGrid
+                // 画面里已经有人时不做瓦片扫描：报警已经触发，瓦片的意义是「找人」，
+                // 稳态下省掉这几次推理，帧率能明显提升。空场景才是需要全力搜索的时候。
+                val tiles = if (lastPresent) 0 else tilesPerFrame
+                val detectBegin = SystemClock.elapsedRealtime()
+                detectExecutor.execute {
+                    try {
+                        val collected = ArrayList<PersonCandidate>(tiles + 2)
+                        // 瓦片先跑：整帧推理会让 TFLite 的 MlImage 在关闭时回收底层位图，
+                        // 之后再裁瓦片就会拿到 recycled bitmap。顺序反过来才是安全的。
+                        if (tiles > 0) {
+                            collected += engine.detectTiles(bitmap, grid, tiles)
+                        }
+                        collected += engine.detectFull(bitmap)
+                        detectorCandidates = collected
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "detector failed", t)
+                    } finally {
+                        lastDetectMs = SystemClock.elapsedRealtime() - detectBegin
+                        latch.countDown()
+                    }
                 }
             }
         }
@@ -231,7 +297,7 @@ class FrameAnalyzer(
 
         val now = SystemClock.elapsedRealtime()
 
-        val outcome = fusion.update(poseCandidates, detectorCandidates, frameWidth, frameHeight, now, cfg)
+        val outcome = fusion.update(poseCandidates, detectorCandidates, frameWidth, frameHeight, now, fusionCfg)
         lastPresent = outcome.present
 
 
@@ -239,16 +305,17 @@ class FrameAnalyzer(
         if (++diagTick % 10 == 0) {
             val area = (frameWidth * frameHeight).toFloat().coerceAtLeast(1f)
             val detInfo = detectorCandidates.joinToString(" | ") { c ->
-                String.format(Locale.US, "%.2f[a%.3f]", c.score, c.area() / area)
+                String.format(Locale.US, "%.2f[a%.4f]", c.score, c.area() / area)
             }
             Log.d(
                 TAG,
                 String.format(
                     Locale.US,
-                    "cv=%dms pose=%dms det=%dms accel=%s src=%dx%d pose=%d det=[%s] " +
-                        "-> n=%d fs=%.2f ss=%.2f v=%d %s",
+                    "cv=%dms pose=%dms det=%dms accel=%s src=%dx%d roi=%d/%d(z%d) " +
+                        "pose=%d det=[%s] -> n=%d fs=%.2f ss=%.2f v=%d %s",
                     lastConvertMs, lastPoseMs, lastDetectMs,
                     personEngine?.accelerator ?: "-", frameWidth, frameHeight,
+                    if (roiMode) activeRois.size else 0, activeRois.size, roiCursor,
                     poseCandidates.size, detInfo,
                     outcome.candidates.size, outcome.frameScore, outcome.smoothedScore,
                     outcome.votes, if (outcome.present) "PRESENT" else "none"
@@ -272,6 +339,128 @@ class FrameAnalyzer(
             ),
             outcome
         )
+    }
+
+    // ------------------------------------------------------------ 选区放大识别
+
+    /**
+     * 扫一个选区：裁出外接矩形 -> 姿态 -> 目标检测 -> 坐标平移回原图 -> 按多边形过滤。
+     *
+     * 顺序不能换：ML Kit 的 [InputImage.fromBitmap] 不持有位图所有权，跑完就放手；
+     * 而 TFLite 的 MlImage 关闭时会**回收**传入的位图。所以姿态必须在检测之前。
+     */
+    private fun scanRegion(
+        source: Bitmap,
+        roi: Roi,
+        cfg: DetectionConfig,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        poseOut: MutableList<PersonCandidate>,
+        detOut: MutableList<PersonCandidate>
+    ) {
+        val region = regionOf(roi, source.width, source.height) ?: return
+        val crop = runCatching {
+            Bitmap.createBitmap(source, region.left, region.top, region.width(), region.height())
+        }.onFailure { Log.w(TAG, "roi crop failed", it) }.getOrNull() ?: return
+
+        try {
+            val poseBegin = SystemClock.elapsedRealtime()
+            for (candidate in poseOnCrop(crop, cfg)) {
+                remap(candidate, region.left, region.top, roi, sourceWidth, sourceHeight)?.let { poseOut += it }
+            }
+            lastPoseMs = SystemClock.elapsedRealtime() - poseBegin
+
+            val detected = personEngine?.detectCrop(crop, region.left, region.top).orEmpty()
+            for (candidate in detected) {
+                remap(candidate, region.left, region.top, roi, sourceWidth, sourceHeight)?.let { detOut += it }
+            }
+        } finally {
+            if (!crop.isRecycled) crop.recycle()
+        }
+    }
+
+    /**
+     * 在裁切图上同步跑一次姿态。
+     *
+     * 分析线程和检测线程是分开的，这里从检测线程阻塞等待姿态结果，最多等
+     * [POSE_TIMEOUT_MS]；超时只是少一份证据，不影响这一帧继续往下走。
+     */
+    private fun poseOnCrop(crop: Bitmap, cfg: DetectionConfig): List<PersonCandidate> {
+        val done = CountDownLatch(1)
+        var output: List<PersonCandidate> = emptyList()
+        poseEngine.detect(
+            image = InputImage.fromBitmap(crop, 0),
+            executor = poseExecutor,
+            onResult = { poses ->
+                // 关键点门限按裁切图高度算：放大之后肩宽也随之放大，
+                // 沿用整帧高度会把「够宽」的人重新判成过窄
+                output = PoseScorer.toCandidates(poses, cfg.keypointThreshold, crop.height)
+            },
+            onFailure = { Log.w(TAG, "roi pose failed", it) },
+            onComplete = { done.countDown() }
+        )
+        if (!done.await(POSE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            Log.w(TAG, "roi pose timed out")
+        }
+        return output
+    }
+
+    /** 选区的送检矩形（像素）。外扩一点，避免人站在选区边缘时框被裁掉半个身子 */
+    private fun regionOf(roi: Roi, width: Int, height: Int): Rect? {
+        val b = roi.bounds()
+        val padX = (b.width() * REGION_PAD).coerceAtLeast(MIN_REGION_PAD)
+        val padY = (b.height() * REGION_PAD).coerceAtLeast(MIN_REGION_PAD)
+
+        val left = ((b.left - padX) * width).toInt().coerceIn(0, width - 1)
+        val top = ((b.top - padY) * height).toInt().coerceIn(0, height - 1)
+        val right = ((b.right + padX) * width).toInt().coerceIn(left + 1, width)
+        val bottom = ((b.bottom + padY) * height).toInt().coerceIn(top + 1, height)
+
+        if (right - left < MIN_REGION_PX || bottom - top < MIN_REGION_PX) return null
+        return Rect(left, top, right, bottom)
+    }
+
+    /**
+     * 把裁切图坐标系里的结果平移回整帧坐标系，并判断它是否真的落在选区内。
+     *
+     * 判定用「中心点是否在多边形内」，另外放一条重叠面积的退路：人站在选区边缘时，
+     * 框中心很容易落到多边形外，但身体明明压在里面，这种情况不能丢。
+     */
+    private fun remap(
+        candidate: PersonCandidate,
+        offsetX: Int,
+        offsetY: Int,
+        roi: Roi,
+        sourceWidth: Int,
+        sourceHeight: Int
+    ): PersonCandidate? {
+        val box = RectF(
+            candidate.box.left + offsetX,
+            candidate.box.top + offsetY,
+            candidate.box.right + offsetX,
+            candidate.box.bottom + offsetY
+        )
+        val landmarks = if (candidate.landmarks.isEmpty()) {
+            candidate.landmarks
+        } else {
+            candidate.landmarks.map { it.copy(x = it.x + offsetX, y = it.y + offsetY) }
+        }
+        val moved = candidate.copy(box = box, landmarks = landmarks)
+
+        val cx = box.centerX() / sourceWidth
+        val cy = box.centerY() / sourceHeight
+        if (roi.contains(cx, cy)) return moved
+
+        val bounds = roi.boundsPx(sourceWidth, sourceHeight)
+        val left = max(box.left, bounds.left)
+        val top = max(box.top, bounds.top)
+        val right = min(box.right, bounds.right)
+        val bottom = min(box.bottom, bounds.bottom)
+        if (right <= left || bottom <= top) return null
+
+        val inter = (right - left) * (bottom - top)
+        val own = box.width() * box.height()
+        return if (own > 0f && inter >= own * ROI_OVERLAP_ACCEPT) moved else null
     }
 
     /**
@@ -324,6 +513,33 @@ class FrameAnalyzer(
          * 按 10fps 算约 0.6 秒，既够快又不至于把整帧耗时推高。
          */
         const val DEFAULT_TILES_PER_FRAME = 4
+
+        /** 选区模式下每帧扫几个选区。1 个 ≈ 两次推理，再多帧率就撑不住了 */
+        const val DEFAULT_ROI_PER_FRAME = 1
+
+        /** 选区送检时外接矩形外扩的比例，避免压线的人被裁掉半个身子 */
+        private const val REGION_PAD = 0.06f
+
+        /** 外扩的绝对下限（归一化），小选区上按比例算出来的外扩太少 */
+        private const val MIN_REGION_PAD = 0.012f
+
+        /**
+         * 送检矩形的最小像素边长。低于这个值裁出来全是模糊块，放大到 320 只是把噪声放大，
+         * 白白浪费一次推理。
+         */
+        private const val MIN_REGION_PX = 40
+
+        /** 框与选区的重叠达到框自身面积的这个比例，就认为人确实在选区内 */
+        private const val ROI_OVERLAP_ACCEPT = 0.45f
+
+        /**
+         * 选区模式下的面积下限。整帧模式下 0.003 是为了过滤远处噪点；
+         * 选区是用户亲手划的，这个先验已经足够强，面积门限可以放到极低。
+         */
+        private const val ROI_MIN_AREA_RATIO = 0.0002f
+
+        /** 选区模式下等待单次姿态推理的上限，超时就少一份证据继续走 */
+        private const val POSE_TIMEOUT_MS = 900L
 
         /** 采样网格边长，64×64 ≈ 4096 个采样点，足够反映整体明暗 */
         private const val SAMPLES_PER_SIDE = 64

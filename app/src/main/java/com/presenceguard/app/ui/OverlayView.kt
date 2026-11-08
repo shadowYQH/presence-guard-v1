@@ -1,41 +1,51 @@
 package com.presenceguard.app.ui
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PointF
 import android.graphics.RectF
 import android.util.AttributeSet
+import android.view.MotionEvent
 import android.view.View
 import com.google.mlkit.vision.pose.PoseLandmark
 import com.presenceguard.app.core.DetectionSource
 import com.presenceguard.app.core.FrameResult
 import com.presenceguard.app.core.PersonCandidate
+import com.presenceguard.app.core.Roi
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * 在预览画面上叠加检测结果。
+ * 在预览画面上叠加检测结果，并承担多边形选区的绘制与取点。
  *
  * 坐标转换：检测在「旋转校正后的图像坐标」里做，预览用的是 FILL_CENTER（裁剪填满），
  * 所以这里用同一套等比缩放 + 居中偏移的映射，前置摄像头再做一次水平翻转，
  * 保证框和骨架严丝合缝地贴在画面上。
+ *
+ * 选区取点是这套映射的**逆变换**：屏幕点 -> 归一化坐标（0~1）。存归一化值而不是像素，
+ * 是为了让选区在换分辨率、换镜头、切前后摄之后依然落在同一个物理位置上。
  */
 class OverlayView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
+    /** 画面的几何信息。与检测结果分开保存：点「清空」时不该把坐标系一起丢掉 */
+    private data class Geometry(val srcW: Int, val srcH: Int, val mirrored: Boolean)
+
     private data class Snapshot(
         val candidates: List<PersonCandidate>,
-        val srcW: Int,
-        val srcH: Int,
-        val mirrored: Boolean,
         val present: Boolean
     )
 
-    private var snapshot = Snapshot(emptyList(), 0, 0, false, false)
+    private var geometry: Geometry? = null
+    private var snapshot = Snapshot(emptyList(), false)
 
     /** 关掉骨架只留框，画面更干净 */
     var showSkeleton: Boolean = true
@@ -43,6 +53,31 @@ class OverlayView @JvmOverloads constructor(
             field = value
             invalidate()
         }
+
+    /** 已确认的多边形选区。由外部（Activity）负责持久化，本视图只负责画和改。 */
+    var rois: List<Roi> = emptyList()
+        private set
+
+    /** 选区变化回调，参数是变化后的完整列表 */
+    var onRoisChange: ((List<Roi>) -> Unit)? = null
+
+    /** 正在绘制中的多边形顶点（归一化坐标） */
+    private val draft = ArrayList<PointF>()
+
+    /**
+     * 取点模式。开启后吃掉全部触摸事件，改由自己解释为「加一个顶点」，
+     * 关闭时一律返回 false，把事件让给下面层的控件。
+     */
+    var editMode: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            if (!value && draft.size < Roi.MIN_POINTS) draft.clear()
+            if (value) closeHintReady = false
+            invalidate()
+        }
+
+    private var closeHintReady = false
 
     private val density = resources.displayMetrics.density
 
@@ -73,47 +108,284 @@ class OverlayView @JvmOverloads constructor(
         color = Color.parseColor("#99FF3B30")
     }
 
+    // ---- 选区专用画笔
+    private val roiFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.parseColor("#3322D3EE")
+    }
+    private val roiStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(2f)
+        color = Color.parseColor("#FF22D3EE")
+    }
+    private val draftStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(2f)
+        color = Color.parseColor("#FFFFD60A")
+        pathEffect = DashPathEffect(floatArrayOf(dp(7f), dp(5f)), 0f)
+    }
+    private val vertexPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.parseColor("#FFFFD60A")
+    }
+    private val vertexFirstPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(2.5f)
+        color = Color.parseColor("#FFFF9F0A")
+    }
+    private val hintBg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.parseColor("#CC000000")
+    }
+    private val hintText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#FFF2F2F7")
+        textSize = sp(12f)
+    }
+
     private val boxRect = RectF()
     private val path = Path()
+    private val roiPath = Path()
+    private val pointScratch = PointF()
+
+    // ------------------------------------------------------------ 对外接口
 
     fun render(result: FrameResult, present: Boolean) {
         if (result.sourceWidth <= 0 || result.sourceHeight <= 0) return
-        snapshot = Snapshot(result.candidates, result.sourceWidth, result.sourceHeight, result.mirrored, present)
+        geometry = Geometry(result.sourceWidth, result.sourceHeight, result.mirrored)
+        snapshot = Snapshot(result.candidates, present)
         invalidate()
     }
 
+    /** 清空检测结果（不动坐标系，也不动选区） */
     fun clear() {
-        snapshot = Snapshot(emptyList(), 0, 0, false, false)
+        snapshot = Snapshot(emptyList(), false)
         invalidate()
     }
+
+    fun setRois(list: List<Roi>) {
+        rois = list.filter { it.isValid }
+        draft.clear()
+        invalidate()
+    }
+
+    /**
+     * 撤销一步：优先删掉正在画的最后一个顶点；没有草稿就删掉最后一个已确认的选区。
+     */
+    fun undo() {
+        when {
+            draft.isNotEmpty() -> draft.removeAt(draft.size - 1)
+            rois.isNotEmpty() -> {
+                rois = rois.dropLast(1)
+                onRoisChange?.invoke(rois)
+            }
+            else -> return
+        }
+        closeHintReady = false
+        invalidate()
+    }
+
+    fun clearRois() {
+        if (rois.isEmpty() && draft.isEmpty()) return
+        rois = emptyList()
+        draft.clear()
+        closeHintReady = false
+        onRoisChange?.invoke(rois)
+        invalidate()
+    }
+
+    /**
+     * 结束当前多边形：顶点数够就闭合收下，不够就丢弃草稿。
+     * @return 是否成功收下一个选区
+     */
+    fun finishDraft(): Boolean {
+        if (draft.size < Roi.MIN_POINTS) {
+            draft.clear()
+            closeHintReady = false
+            invalidate()
+            return false
+        }
+        val candidate = Roi(draft.toList())
+        draft.clear()
+        closeHintReady = false
+        if (candidate.areaRatio() < Roi.MIN_AREA_RATIO) {
+            invalidate()
+            return false
+        }
+        rois = rois + candidate
+        onRoisChange?.invoke(rois)
+        invalidate()
+        return true
+    }
+
+    fun draftPointCount(): Int = draft.size
+
+    // ------------------------------------------------------------ 触摸取点
+
+    @SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!editMode) return false
+        if (event.actionMasked != MotionEvent.ACTION_DOWN) return true
+
+        val point = toNormalized(event.x, event.y) ?: return true
+
+        // 离上一个顶点太近 = 手指抖动，忽略，否则多边形会退化成一堆重合点
+        if (draft.isNotEmpty()) {
+            val last = draft.last()
+            if (hypot(point.x - last.x, point.y - last.y) < Roi.MIN_VERTEX_GAP) return true
+        }
+
+        // 点回起点即闭合
+        if (draft.size >= Roi.MIN_POINTS) {
+            val first = draft.first()
+            if (hypot(point.x - first.x, point.y - first.y) < CLOSE_GAP) {
+                finishDraft()
+                return true
+            }
+        }
+
+        draft += point
+        closeHintReady = draft.size >= Roi.MIN_POINTS
+        invalidate()
+        return true
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
+    }
+
+    /** 屏幕坐标 -> 归一化图像坐标（FILL_CENTER 映射的逆变换） */
+    private fun toNormalized(viewX: Float, viewY: Float): PointF? {
+        val geo = geometry ?: return null
+        if (geo.srcW <= 0 || geo.srcH <= 0 || width <= 0 || height <= 0) return null
+
+        val scale = max(width / geo.srcW.toFloat(), height / geo.srcH.toFloat())
+        val offsetX = (width - geo.srcW * scale) / 2f
+        val offsetY = (height - geo.srcH * scale) / 2f
+
+        val px = if (geo.mirrored) width - viewX else viewX
+        val nx = ((px - offsetX) / scale) / geo.srcW
+        val ny = ((viewY - offsetY) / scale) / geo.srcH
+        return PointF(nx.coerceIn(0f, 1f), ny.coerceIn(0f, 1f))
+    }
+
+    // ------------------------------------------------------------ 绘制
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        val geo = geometry
         val snap = snapshot
-        if (snap.srcW <= 0 || snap.srcH <= 0) return
 
-        val scale = max(width / snap.srcW.toFloat(), height / snap.srcH.toFloat())
-        val offsetX = (width - snap.srcW * scale) / 2f
-        val offsetY = (height - snap.srcH * scale) / 2f
+        if (geo != null && geo.srcW > 0 && geo.srcH > 0) {
+            val scale = max(width / geo.srcW.toFloat(), height / geo.srcH.toFloat())
+            val offsetX = (width - geo.srcW * scale) / 2f
+            val offsetY = (height - geo.srcH * scale) / 2f
 
-        if (snap.present) {
-            // 状态确认时给画面加一圈红边，余光也能看到
-            val inset = edgeGlow.strokeWidth / 2f
-            canvas.drawRect(inset, inset, width - inset, height - inset, edgeGlow)
+            if (snap.present) {
+                // 状态确认时给画面加一圈红边，余光也能看到
+                val inset = edgeGlow.strokeWidth / 2f
+                canvas.drawRect(inset, inset, width - inset, height - inset, edgeGlow)
+            }
+
+            for (candidate in snap.candidates) {
+                val left = mapX(candidate.box.left, scale, offsetX, geo.mirrored)
+                val right = mapX(candidate.box.right, scale, offsetX, geo.mirrored)
+                val top = mapY(candidate.box.top, scale, offsetY)
+                val bottom = mapY(candidate.box.bottom, scale, offsetY)
+
+                boxRect.set(min(left, right), top, max(left, right), bottom)
+                // 边界外扩的框可能超出画面，裁一裁再画，避免圆角变形
+                if (!boxRect.intersect(0f, 0f, width.toFloat(), height.toFloat())) continue
+
+                drawCandidate(canvas, candidate, boxRect, scale, offsetX, offsetY, geo.mirrored)
+            }
+
+            drawRois(canvas, geo, scale, offsetX, offsetY)
+            drawDraft(canvas, geo, scale, offsetX, offsetY)
         }
 
-        for (candidate in snap.candidates) {
-            val left = mapX(candidate.box.left, scale, offsetX, snap.mirrored)
-            val right = mapX(candidate.box.right, scale, offsetX, snap.mirrored)
-            val top = mapY(candidate.box.top, scale, offsetY)
-            val bottom = mapY(candidate.box.bottom, scale, offsetY)
+        if (editMode) drawEditHint(canvas)
+    }
 
-            boxRect.set(min(left, right), top, max(left, right), bottom)
-            // 边界外扩的框可能超出画面，裁一裁再画，避免圆角变形
-            if (!boxRect.intersect(0f, 0f, width.toFloat(), height.toFloat())) continue
+    private fun drawRois(canvas: Canvas, geo: Geometry, scale: Float, offsetX: Float, offsetY: Float) {
+        if (rois.isEmpty() && draft.isEmpty() && !editMode) return
 
-            drawCandidate(canvas, candidate, boxRect, scale, offsetX, offsetY, snap.mirrored)
+        rois.forEachIndexed { index, roi ->
+            roiPath.reset()
+            roi.points.forEachIndexed { i, point ->
+                toScreen(point, geo, scale, offsetX, offsetY)
+                if (i == 0) roiPath.moveTo(pointScratch.x, pointScratch.y)
+                else roiPath.lineTo(pointScratch.x, pointScratch.y)
+            }
+            roiPath.close()
+
+            canvas.drawPath(roiPath, roiFill)
+            canvas.drawPath(roiPath, roiStroke)
+
+            // 编号标在第一个顶点旁边，方便和多边形一一对应
+            val first = roi.points.first()
+            toScreen(first, geo, scale, offsetX, offsetY)
+            val text = "${index + 1}"
+            val tx = pointScratch.x.coerceIn(dp(4f), width - dp(18f))
+            val ty = (pointScratch.y - dp(6f)).coerceIn(dp(16f), height - dp(4f))
+            canvas.drawCircle(tx, ty, dp(9f), roiStroke)
+            canvas.drawText(text, tx - dp(3f), ty + dp(4f), labelText)
         }
+    }
+
+    private fun drawDraft(canvas: Canvas, geo: Geometry, scale: Float, offsetX: Float, offsetY: Float) {
+        if (draft.isEmpty()) return
+
+        path.reset()
+        draft.forEachIndexed { i, point ->
+            toScreen(point, geo, scale, offsetX, offsetY)
+            if (i == 0) path.moveTo(pointScratch.x, pointScratch.y)
+            else path.lineTo(pointScratch.x, pointScratch.y)
+        }
+        canvas.drawPath(path, draftStroke)
+
+        // 顶点之间已经连成线，再给每个顶点画个实心点，看清自己点到哪了
+        draft.forEach { point ->
+            toScreen(point, geo, scale, offsetX, offsetY)
+            canvas.drawCircle(pointScratch.x, pointScratch.y, dp(3.5f), vertexPaint)
+        }
+
+        // 首点加个圈：提示「点这里可以闭合」
+        toScreen(draft.first(), geo, scale, offsetX, offsetY)
+        canvas.drawCircle(
+            pointScratch.x, pointScratch.y,
+            dp(if (closeHintReady) 11f else 7f), vertexFirstPaint
+        )
+
+        if (closeHintReady) {
+            // 虚线连回起点，让「还差一步闭合」这件事在视觉上成立
+            toScreen(draft.last(), geo, scale, offsetX, offsetY)
+            path.reset()
+            path.moveTo(pointScratch.x, pointScratch.y)
+            toScreen(draft.first(), geo, scale, offsetX, offsetY)
+            path.lineTo(pointScratch.x, pointScratch.y)
+            canvas.drawPath(path, draftStroke)
+        }
+    }
+
+    private fun drawEditHint(canvas: Canvas) {
+        val text = when {
+            draft.isEmpty() -> "点按画面添加多边形顶点"
+            draft.size < Roi.MIN_POINTS -> "继续点，至少 ${Roi.MIN_POINTS} 个点（已 ${draft.size}）"
+            else -> "再点 ${Roi.MIN_POINTS} 点以上可继续加，点回起点闭合"
+        }
+        val textWidth = hintText.measureText(text)
+        val padH = dp(10f)
+        val padV = dp(6f)
+        val boxHeight = hintText.textSize + padV * 2
+        val left = (width - textWidth - padH * 2) / 2f
+        val top = height - boxHeight - dp(96f)
+
+        canvas.drawRoundRect(
+            left, top, left + textWidth + padH * 2, top + boxHeight,
+            dp(6f), dp(6f), hintBg
+        )
+        canvas.drawText(text, left + padH, top + boxHeight - padV - dp(1f), hintText)
     }
 
     private fun drawCandidate(
@@ -196,6 +468,16 @@ class OverlayView @JvmOverloads constructor(
         DetectionSource.DETECTOR -> Color.parseColor("#FFFF9F0A")
     }
 
+    /** 归一化坐标 -> 屏幕坐标（就地写入 [pointScratch]，避免每帧产生大量临时对象） */
+    private fun toScreen(point: PointF, geo: Geometry, scale: Float, offsetX: Float, offsetY: Float) {
+        val sx = point.x * geo.srcW
+        val sy = point.y * geo.srcH
+        var vx = sx * scale + offsetX
+        if (geo.mirrored) vx = width - vx
+        pointScratch.x = vx
+        pointScratch.y = sy * scale + offsetY
+    }
+
     private fun mapX(x: Float, scale: Float, offsetX: Float, mirrored: Boolean): Float {
         val mapped = x * scale + offsetX
         return if (mirrored) width - mapped else mapped
@@ -211,6 +493,9 @@ class OverlayView @JvmOverloads constructor(
     private fun sp(value: Float): Float = value * resources.displayMetrics.scaledDensity
 
     companion object {
+        /** 点回起点的判定半径（归一化）。太小手指够不到，太大会误闭合 */
+        private const val CLOSE_GAP = 0.035f
+
         /** BlazePose 的关键点连线（只取上半身与四肢主干，够表达姿态又不显杂乱） */
         private val BONES: List<Pair<Int, Int>> = listOf(
             PoseLandmark.LEFT_SHOULDER to PoseLandmark.RIGHT_SHOULDER,

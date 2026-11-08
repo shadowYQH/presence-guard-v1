@@ -150,6 +150,28 @@ class TflitePersonEngine(
     }
 
     /**
+     * 在**已经裁好的**位图上做一次推理，结果坐标按 (offsetX, offsetY) 平移回原图。
+     *
+     * 这是「多边形内放大识别」的入口：调用方把选区的外接矩形裁出来（可选外扩），
+     * 送进固定 320×320 的模型后，选区里的人在模型视野里被放大了 1/选区占比 倍，
+     * 相当于凭空多出一台长焦镜头。
+     *
+     * 注意：TFLite 的 MlImage 在关闭时会**回收传入的位图**，所以本方法返回后
+     * [crop] 就不能再用了。调用方如果需要同一块裁切图做别的事（比如再跑一次姿态），
+     * 必须在调用本方法**之前**做完。
+     */
+    fun detectCrop(
+        crop: Bitmap,
+        offsetX: Int,
+        offsetY: Int,
+        scoreDiscount: Float = 1f
+    ): List<PersonCandidate> {
+        val engine = detector ?: return emptyList()
+        if (crop.isRecycled) return emptyList()
+        return infer(engine, crop, offsetX, offsetY, scoreDiscount)
+    }
+
+    /**
      * 瓦片滚动扫描：每帧只跑 [limit] 片，游标轮转，若干帧覆盖全图。
      * 只回传「小目标」——瓦片本来就是为了捞远处的小东西，大目标交给整帧那一路，
      * 否则同一个人会被多个瓦片各框一次，徒增重复。

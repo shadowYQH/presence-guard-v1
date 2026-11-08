@@ -17,9 +17,12 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import android.util.Size
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCase
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -33,6 +36,7 @@ import com.presenceguard.app.R
 import com.presenceguard.app.audio.AlertPlayer
 import com.presenceguard.app.audio.AlertTone
 import com.presenceguard.app.core.FrameResult
+import com.presenceguard.app.core.Roi
 import com.presenceguard.app.core.Sensitivity
 import com.presenceguard.app.data.Settings
 import com.presenceguard.app.detect.FrameAnalyzer
@@ -111,6 +115,23 @@ class DetectionService : Service(), LifecycleOwner {
     private var paused = false
     private var initializing = false
 
+    /** 当前绑定的相机，变焦要经过它 */
+    private var camera: Camera? = null
+
+    /** 变焦倍率。CameraX 的 zoom 对预览与分析流同时生效 */
+    private var zoomRatio = 1f
+
+    /** 后置物理镜头列表。有些机型会把广角/长焦都暴露出来，可以手动切 */
+    private var backInfos: List<CameraInfo> = emptyList()
+    private var lensIndex = 0
+
+    /**
+     * 预览是否应当输出画面。界面不可见（息屏 / 切后台）时置 false，
+     * 此时 [bindCamera] 干脆不绑 Preview 用例——不是「绑了但不送帧」，
+     * 是连那条相机输出流都不创建，从根上省掉这部分功耗。
+     */
+    private var previewVisible = false
+
     private var status = Status(Phase.INITIALIZING)
     private var lastAlertAt = 0L
     private var lastNotifyAt = 0L
@@ -125,6 +146,8 @@ class DetectionService : Service(), LifecycleOwner {
 
         lensFacing = settings.lensFacing
         sensitivity = settings.sensitivity
+        zoomRatio = settings.zoomRatio
+        lensIndex = settings.lensIndex
         alertPlayer.setTone(settings.tone)
         alertPlayer.setVibrateEnabled(true)
 
@@ -186,6 +209,8 @@ class DetectionService : Service(), LifecycleOwner {
 
     fun currentStatus(): Status = status
 
+    fun currentSensitivity(): Sensitivity = sensitivity
+
     fun setSensitivity(value: Sensitivity) {
         sensitivity = value
         settings.sensitivity = value
@@ -244,11 +269,93 @@ class DetectionService : Service(), LifecycleOwner {
         mainHandler.post { bindCamera() }
     }
 
+    // ------------------------------------------------------------ 焦段 / 镜头
+
+    fun currentZoom(): Float = zoomRatio
+
+    /** 当前镜头支持的变焦区间；相机还没就绪时给一个保守的默认值 */
+    fun zoomRange(): Pair<Float, Float> {
+        val state = camera?.cameraInfo?.zoomState?.value
+            ?: return 1f to Settings.MAX_ZOOM
+        return state.minZoomRatio to state.maxZoomRatio
+    }
+
+    /**
+     * 设置变焦倍率。
+     *
+     * 走 CameraX 的 zoom 而不是「裁切预览画面」——前者是传感器级的区域裁切（部分机型
+     * 还会自动切换到长焦镜头），分析流拿到的就是放大后的真实像素，检测精度跟着提升；
+     * 后者只是把已经很模糊的一小块拉大，对识别没有任何帮助。
+     */
+    fun setZoomRatio(ratio: Float) {
+        zoomRatio = ratio.coerceIn(1f, Settings.MAX_ZOOM)
+        settings.zoomRatio = zoomRatio
+        applyZoom()
+    }
+
+    private fun applyZoom() {
+        val cam = camera ?: return
+        val state = cam.cameraInfo.zoomState.value ?: return
+        val target = zoomRatio.coerceIn(state.minZoomRatio, state.maxZoomRatio)
+        runCatching { cam.cameraControl.setZoomRatio(target) }
+            .onFailure { Log.w(TAG, "setZoomRatio failed", it) }
+        Log.i(TAG, "zoom=$target (range ${state.minZoomRatio}..${state.maxZoomRatio})")
+    }
+
+    /** 后置可切换的物理镜头数量。多数机型只暴露一个，此时镜头发切换没有意义 */
+    fun lensCount(): Int = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
+        backInfos.size.coerceAtLeast(1)
+    } else {
+        1
+    }
+
+    fun currentLensIndex(): Int = lensIndex
+
+    /**
+     * 切换到下一个后置物理镜头。
+     *
+     * 通过 [CameraSelector.Builder.addCameraFilter] 把候选相机列表裁到只剩目标那一颗，
+     * 这样 CameraX 就会绑定到具体的物理镜头，而不是系统给的默认逻辑相机。
+     */
+    fun cycleLens() {
+        if (lensCount() <= 1) return
+        lensIndex = (lensIndex + 1) % backInfos.size
+        settings.lensIndex = lensIndex
+        fusion.reset()
+        Log.i(TAG, "switch to back lens #$lensIndex of ${backInfos.size}")
+        mainHandler.post { bindCamera() }
+    }
+
+    // ------------------------------------------------------------ 选区
+
+    fun currentRois(): List<Roi> = settings.rois
+
+    /**
+     * 更新选区。非空即开启「选区模式」：只在这些多边形里判定，
+     * 区域内做放大识别，区域外完全不看。
+     */
+    fun setRois(list: List<Roi>) {
+        settings.rois = list
+        analyzer?.rois = list
+        analyzer?.roiPerFrame = roiBudgetFor(list.size)
+        fusion.reset()
+        Log.i(TAG, "rois=${list.size} budget=${roiBudgetFor(list.size)}")
+    }
+
+    private fun roiBudgetFor(count: Int): Int {
+        if (count <= 0) return 0
+        // 一个选区 ≈ 检测 + 姿态两次推理。每帧多扫一个就多一份固定成本，
+        // 所以上限卡在 2，更多选区靠游标轮转覆盖。
+        return count.coerceAtMost(if (settings.powerSave) 1 else 2)
+    }
+
     fun setPowerSave(enabled: Boolean) {
         settings.powerSave = enabled
         analyzer?.minFrameIntervalMs = if (enabled) POWER_SAVE_FRAME_INTERVAL else 0L
         // 省电模式下关掉瓦片精细路：远处的小目标会漏，但功耗能降一大截
         analyzer?.tilesPerFrame = if (enabled) 0 else tilesForSensitivity(sensitivity)
+        // 选区路是「有明确目标」时才开的，省电下保留但减到每帧 1 个
+        analyzer?.roiPerFrame = roiBudgetFor(analyzer?.rois?.size ?: 0)
     }
 
     fun isPowerSave(): Boolean = settings.powerSave
@@ -278,6 +385,26 @@ class DetectionService : Service(), LifecycleOwner {
         runCatching { previewUseCase?.setSurfaceProvider(surfaceProvider) }
     }
 
+    /**
+     * 界面是否可见。
+     *
+     * 这里做的是「重新绑相机」而不是「设个标志位」：
+     * CameraX 的 Preview 用例只要还绑在相机上，就会持续占用一条相机输出流 + 显示合成，
+     * 即便 surface 已经被摘掉。把 Preview 从绑定的用例列表里去掉，[bindCamera] 就只绑
+     * ImageAnalysis，那条输出流根本不会被创建——这是唯一能让预览功耗真正归零的做法。
+     *
+     * 代价是一次相机的关闭与重开（几百毫秒）。只在息屏 / 切后台时发生，可以接受。
+     */
+    fun setPreviewVisible(visible: Boolean) {
+        if (previewVisible == visible) return
+        previewVisible = visible
+        Log.i(TAG, "previewVisible=$visible")
+        if (analyzer == null) return
+        mainHandler.post { bindCamera() }
+    }
+
+    fun isPreviewVisible(): Boolean = previewVisible
+
     // ------------------------------------------------------------ 初始化
 
     private fun bootstrap() {
@@ -304,6 +431,8 @@ class DetectionService : Service(), LifecycleOwner {
                     mirrored = lensFacing == CameraSelector.LENS_FACING_FRONT
                     minFrameIntervalMs = if (settings.powerSave) POWER_SAVE_FRAME_INTERVAL else 0L
                     tilesPerFrame = tilesForSensitivity(sensitivity)
+                    rois = settings.rois
+                    roiPerFrame = roiBudgetFor(settings.rois.size)
                 }
                 bindCamera()
                 updateStatus(Status(Phase.RUNNING))
@@ -312,7 +441,11 @@ class DetectionService : Service(), LifecycleOwner {
     }
 
     private fun bindCamera() {
-        val analyzerRef = analyzer ?: return
+        val analyzerRef = analyzer ?: run {
+            Log.w(TAG, "bindCamera skipped: analyzer not ready")
+            return
+        }
+        Log.i(TAG, "bindCamera() previewVisible=$previewVisible facing=$lensFacing")
 
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
@@ -321,13 +454,12 @@ class DetectionService : Service(), LifecycleOwner {
                 updateStatus(Status(Phase.ERROR, message = "相机初始化失败"))
                 return@addListener
             }
+            Log.i(TAG, "camera provider ready")
             cameraProvider = provider
             provider.unbindAll()
+            camera = null
+            backInfos = collectBackCameras(provider)
 
-            val preview = Preview.Builder().build()
-            previewUseCase = preview
-            // 关键：不接 SurfaceProvider 的话，相机照样开、检测照样跑，但屏幕上永远没画面
-            pendingSurfaceProvider?.let { preview.setSurfaceProvider(it) }
             val resolutionSelector = ResolutionSelector.Builder()
                 .setResolutionStrategy(
                     ResolutionStrategy(
@@ -350,15 +482,31 @@ class DetectionService : Service(), LifecycleOwner {
             )
             analyzerRef.minFrameIntervalMs = if (settings.powerSave) POWER_SAVE_FRAME_INTERVAL else 0L
             analyzerRef.tilesPerFrame = tilesForSensitivity(sensitivity)
+            analyzerRef.rois = settings.rois
+            analyzerRef.roiPerFrame = roiBudgetFor(settings.rois.size)
 
             analysisUseCase?.clearAnalyzer()
             analysisUseCase = analysis
 
             if (!paused) analysis.setAnalyzer(cameraExecutor, analyzerRef)
 
-            val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+            val useCases = ArrayList<UseCase>(2)
+            if (previewVisible) {
+                val preview = Preview.Builder().build()
+                previewUseCase = preview
+                // 关键：不接 SurfaceProvider 的话，相机照样开、检测照样跑，但屏幕上永远没画面
+                pendingSurfaceProvider?.let { preview.setSurfaceProvider(it) }
+                useCases += preview
+            } else {
+                // 界面不可见：干脆不绑 Preview，省掉整条预览输出流
+                previewUseCase = null
+            }
+            useCases += analysis
+
+            var bound = false
             try {
-                provider.bindToLifecycle(this, selector, preview, analysis)
+                camera = provider.bindToLifecycle(this, selectorFor(lensFacing), *useCases.toTypedArray())
+                bound = true
             } catch (t: Throwable) {
                 Log.w(TAG, "bind failed, retry with other lens", t)
                 lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
@@ -367,14 +515,56 @@ class DetectionService : Service(), LifecycleOwner {
                     CameraSelector.LENS_FACING_BACK
                 }
                 runCatching {
-                    val fallback = CameraSelector.Builder().requireLensFacing(lensFacing).build()
-                    provider.bindToLifecycle(this, fallback, preview, analysis)
+                    camera = provider.bindToLifecycle(this, selectorFor(lensFacing), *useCases.toTypedArray())
                     analyzerRef.mirrored = lensFacing == CameraSelector.LENS_FACING_FRONT
+                    bound = true
                 }.onFailure {
                     updateStatus(Status(Phase.ERROR, message = "无法打开摄像头"))
                 }
             }
+
+            if (bound) {
+                applyZoom()
+                Log.i(
+                    TAG,
+                    "bound facing=$lensFacing lens=$lensIndex/${backInfos.size} preview=$previewVisible"
+                )
+            }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    /**
+     * 收集可用的后置物理镜头。
+     *
+     * 用 [CameraSelector.DEFAULT_BACK_CAMERA.filter] 反查，而不是读 Camera2 的私有字段：
+     * 前者是公开 API，对「逻辑相机 + 物理相机」的差异由 CameraX 自己处理。
+     */
+    private fun collectBackCameras(provider: ProcessCameraProvider): List<CameraInfo> {
+        val infos = runCatching {
+            provider.availableCameraInfos.filter { info ->
+                CameraSelector.DEFAULT_BACK_CAMERA.filter(listOf(info)).isNotEmpty()
+            }
+        }.getOrDefault(emptyList())
+        if (infos.isNotEmpty()) {
+            lensIndex = lensIndex.coerceIn(0, infos.size - 1)
+        } else {
+            lensIndex = 0
+        }
+        return infos
+    }
+
+    /**
+     * 构造相机选择器。后置有多颗物理镜头时，把候选列表裁到只剩用户选中的那颗。
+     */
+    private fun selectorFor(facing: Int): CameraSelector {
+        val builder = CameraSelector.Builder().requireLensFacing(facing)
+        if (facing == CameraSelector.LENS_FACING_BACK && backInfos.size > 1) {
+            val target = backInfos[lensIndex.coerceIn(0, backInfos.size - 1)]
+            builder.addCameraFilter { infos ->
+                infos.filter { it == target }.ifEmpty { infos }
+            }
+        }
+        return builder.build()
     }
 
     // ------------------------------------------------------------ 帧回调

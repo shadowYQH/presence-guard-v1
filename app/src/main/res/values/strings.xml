@@ -27,6 +27,20 @@
     <string name="btn_power_off">省电 关</string>
     <string name="btn_power_on">省电 开</string>
 
+    <string name="btn_zoom_default">焦段 1.0x</string>
+    <string name="btn_zoom_fmt">焦段 %1$s</string>
+    <string name="btn_lens_default">镜头 1</string>
+    <string name="btn_lens_fmt">镜头 %1$d</string>
+    <string name="btn_roi">选区</string>
+    <string name="btn_roi_done">完成选区</string>
+    <string name="btn_roi_count_fmt">选区 ×%1$d</string>
+    <string name="btn_roi_undo">撤销</string>
+    <string name="btn_roi_clear">清空</string>
+
+    <string name="hint_roi_on">已在 %1$d 个选区内放大识别，区域外不判定</string>
+    <string name="hint_roi_off">已取消选区，恢复全画面检测</string>
+    <string name="hint_roi_added">选区已保存</string>
+
     <string name="hint_power_on">省电模式：每秒分析 5 帧，够判断有没有人</string>
     <string name="hint_power_off">已恢复全速分析</string>
 

@@ -1,9 +1,11 @@
 package com.presenceguard.app
 
 import android.Manifest
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
@@ -15,7 +17,9 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import com.presenceguard.app.core.FrameResult
+import com.presenceguard.app.core.Roi
 import com.presenceguard.app.core.Sensitivity
 import com.presenceguard.app.databinding.ActivityMainBinding
 import com.presenceguard.app.detect.PresenceFusionEngine
@@ -38,6 +42,34 @@ class MainActivity : AppCompatActivity() {
     private var lastCount = -1
     private var metricTick = 0
     private var cachedSensitivity = Sensitivity.MEDIUM
+    private var rois: List<Roi> = emptyList()
+
+    /** 屏幕是否亮着。熄屏时要主动摘掉预览，见 [screenReceiver] 的注释 */
+    private var screenOn = true
+
+    /**
+     * 屏幕开关广播。
+     *
+     * 为什么不能只靠 onStop：实测在 Android 13 上按下电源键熄屏后，Activity 不一定
+     * 立刻收到 onStop（系统只是让显示进入 doze，进程仍被视作可见），于是预览流会继续跑。
+     * ACTION_SCREEN_OFF 是确定会来的，用它兜底。
+     */
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val action = intent?.action ?: return
+            android.util.Log.i("MainActivity", "screen broadcast: $action")
+            when (action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    screenOn = false
+                    service?.setPreviewVisible(false)
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    screenOn = true
+                    if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) attachPreview()
+                }
+            }
+        }
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -56,6 +88,10 @@ class MainActivity : AppCompatActivity() {
             bound = true
             local.service.addListener(frameListener)
             attachPreview()
+            // 选区是持久化的，服务里那份才是权威值
+            rois = local.service.currentRois()
+            binding.overlayView.setRois(rois)
+            cachedSensitivity = local.service.currentSensitivity()
             syncButtons()
         }
 
@@ -103,6 +139,7 @@ class MainActivity : AppCompatActivity() {
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setupControls()
+        registerScreenReceiver()
 
         if (hasCameraPermission()) {
             startAndBind()
@@ -120,16 +157,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 在这里绑定预览。
+     *
+     * 用 onResume/onPause 而不是 onStart/onStop，是因为实测（MIUI Android 13）熄屏后
+     * Activity 只走到 paused，onStop 迟迟不来；单靠 onStop 摘预览，熄屏时那条相机
+     * 输出流会一直跑。onPause 一定会被调用，和 onResume 成对，行为可预期。
+     */
+    override fun onResume() {
+        super.onResume()
+        if (bound) attachPreview()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // 界面不在前台：把 Preview 用例从相机上摘掉，只留 ImageAnalysis
+        android.util.Log.i("MainActivity", "onPause: detach preview")
+        service?.setPreviewVisible(false)
+    }
+
     override fun onStop() {
         super.onStop()
         // 界面不可见时摘掉回调，避免后台堆积 UI 消息；检测本身仍在服务里跑
         if (bound) service?.removeListener(frameListener)
-        // 顺便断开预览渲染：息屏 / 切后台时不必再往屏幕送帧
-        if (bound) service?.setPreviewSurfaceProvider(null)
+        // 关键：让服务把 Preview 用例整个解绑。只是摘掉 SurfaceProvider 的话，
+        // 相机的那条预览输出流还在跑，息屏后这部分功耗不会停。
+        if (bound) service?.setPreviewVisible(false)
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        runCatching { unregisterReceiver(screenReceiver) }
         if (bound) {
             runCatching { service?.removeListener(frameListener) }
             runCatching { unbindService(serviceConnection) }
@@ -162,9 +220,20 @@ class MainActivity : AppCompatActivity() {
         binding.btnGrant.setOnClickListener { requestPermissions() }
     }
 
-    /** 把 PreviewView 的画面通道交给服务里的 Preview 用例 */
+    /** 把 PreviewView 的画面通道交给服务里的 Preview 用例，并让它把预览绑回去 */
     private fun attachPreview() {
-        service?.setPreviewSurfaceProvider(binding.previewView.surfaceProvider)
+        val svc = service ?: return
+        svc.setPreviewSurfaceProvider(binding.previewView.surfaceProvider)
+        // 屏幕还没亮就别急着绑预览
+        if (screenOn) svc.setPreviewVisible(true)
+    }
+
+    private fun registerScreenReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        ContextCompat.registerReceiver(this, screenReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
     }
 
     // ------------------------------------------------------------ 界面
@@ -231,6 +300,36 @@ class MainActivity : AppCompatActivity() {
             ).show()
         }
 
+        // ---------------------------------------------------------- 焦段 / 镜头
+        binding.btnZoom.setOnClickListener { cycleZoom() }
+
+        binding.btnLens.setOnClickListener {
+            service?.cycleLens()
+            updateLensButton()
+        }
+
+        // ---------------------------------------------------------- 多边形选区
+        binding.btnRoi.setOnClickListener { toggleRoiEdit() }
+
+        binding.btnRoiUndo.setOnClickListener {
+            val overlay = binding.overlayView
+            // 编辑中 = 撤销一步（先撤顶点、再撤整个选区）；非编辑中 = 一键清空
+            if (overlay.editMode) overlay.undo() else overlay.clearRois()
+            updateRoiButton()
+        }
+
+        binding.overlayView.onRoisChange = { list ->
+            rois = list
+            service?.setRois(list)
+            updateRoiButton()
+            Toast.makeText(
+                this,
+                if (list.isEmpty()) getString(R.string.hint_roi_off)
+                else getString(R.string.hint_roi_on, list.size),
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+
         // 暗屏状态下任意触摸即恢复亮度，避免用户找不到退出方式
         binding.root.setOnTouchListener { _, _ ->
             if (dimmed) {
@@ -243,6 +342,71 @@ class MainActivity : AppCompatActivity() {
 
         updateSensitivityButton(cachedSensitivity)
         updateSoundButton(true)
+        updateRoiButton()
+    }
+
+    // ------------------------------------------------------------ 焦段 / 镜头
+
+    /**
+     * 循环切换变焦档位。
+     *
+     * 只列当前镜头确实支持的倍率（不同机型 maxZoomRatio 差别很大），
+     * 切到最大档之后再点一次回到 1x。
+     */
+    private fun cycleZoom() {
+        val svc = service ?: return
+        val (minRatio, maxRatio) = svc.zoomRange()
+        val presets = listOf(1f, 2f, 3f, 5f, 8f)
+            .filter { it >= minRatio - 0.01f && it <= maxRatio + 0.01f }
+            .ifEmpty { listOf(1f) }
+        val current = svc.currentZoom()
+        val next = presets.firstOrNull { it > current + 0.05f } ?: presets.first()
+        svc.setZoomRatio(next)
+        updateZoomButton(next)
+    }
+
+    private fun updateZoomButton(ratio: Float) {
+        binding.btnZoom.text = getString(
+            R.string.btn_zoom_fmt,
+            String.format(Locale.US, "%.1fx", ratio)
+        )
+    }
+
+    /** 后置只有一颗镜头时把按钮藏掉，避免点了没反应 */
+    private fun updateLensButton() {
+        val svc = service
+        val count = svc?.lensCount() ?: 1
+        binding.btnLens.visibility = if (count > 1) View.VISIBLE else View.GONE
+        if (count > 1) {
+            binding.btnLens.text = getString(R.string.btn_lens_fmt, (svc?.currentLensIndex() ?: 0) + 1)
+        }
+    }
+
+    // ------------------------------------------------------------ 选区
+
+    private fun toggleRoiEdit() {
+        val overlay = binding.overlayView
+        val entering = !overlay.editMode
+        // 暗屏下取点看不清画面，先恢复亮度
+        if (entering && dimmed) setDimmed(false)
+        overlay.editMode = entering
+        if (!entering && overlay.finishDraft()) {
+            Toast.makeText(this, R.string.hint_roi_added, Toast.LENGTH_SHORT).show()
+        }
+        updateRoiButton()
+    }
+
+    private fun updateRoiButton() {
+        val overlay = binding.overlayView
+        val count = overlay.rois.size
+        binding.btnRoi.text = when {
+            overlay.editMode -> getString(R.string.btn_roi_done)
+            count > 0 -> getString(R.string.btn_roi_count_fmt, count)
+            else -> getString(R.string.btn_roi)
+        }
+        binding.btnRoiUndo.setText(
+            if (overlay.editMode) R.string.btn_roi_undo else R.string.btn_roi_clear
+        )
     }
 
     private fun updateSensitivityButton(value: Sensitivity) {
@@ -266,6 +430,10 @@ class MainActivity : AppCompatActivity() {
         val svc = service ?: return
         updateSoundButton(svc.isAudioEnabled())
         updatePowerButton(svc.isPowerSave())
+        updateSensitivityButton(cachedSensitivity)
+        updateZoomButton(svc.currentZoom())
+        updateLensButton()
+        updateRoiButton()
         binding.btnTone.text = getString(R.string.btn_tone_fmt, svc.currentTone().displayName)
         binding.btnPause.setText(if (svc.isPaused()) R.string.btn_resume else R.string.btn_pause)
         applyStatus(svc.currentStatus())
