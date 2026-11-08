@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">人影守望</string>
+
+    <string name="status_booting">正在加载</string>
+    <string name="status_booting_detail">初始化检测模型…</string>
+    <string name="status_idle">画面中无人</string>
+    <string name="status_present">检测到人</string>
+    <string name="status_scanning">扫描中</string>
+    <string name="status_paused">已暂停</string>
+    <string name="status_error">检测异常</string>
+    <string name="status_running_detail">持续监测中</string>
+
+    <string name="btn_switch">切换</string>
+    <string name="btn_sensitivity_high">灵敏度 高</string>
+    <string name="btn_sensitivity_medium">灵敏度 中</string>
+    <string name="btn_sensitivity_low">灵敏度 低</string>
+    <string name="btn_sound_on">声音 开</string>
+    <string name="btn_sound_off">声音 关</string>
+    <string name="btn_pause">暂停</string>
+    <string name="btn_resume">继续</string>
+    <string name="btn_test">试听</string>
+    <string name="btn_tone_default">音色 叮咚</string>
+    <string name="btn_tone_fmt">音色 %1$s</string>
+    <string name="btn_dim">暗屏</string>
+    <string name="btn_brighten">亮屏</string>
+    <string name="btn_power_off">省电 关</string>
+    <string name="btn_power_on">省电 开</string>
+
+    <string name="hint_power_on">省电模式：每秒分析 5 帧，够判断有没有人</string>
+    <string name="hint_power_off">已恢复全速分析</string>
+
+    <string name="permission_title">需要相机权限</string>
+    <string name="permission_body">本应用只在设备本地分析画面，判断是否有人出现，不录像、不上传任何图像。</string>
+    <string name="permission_action">授予权限</string>
+
+    <string name="hint_alarm_muted">闹钟音量为 0，提示音可能听不见</string>
+
+    <string name="notify_channel_name">持续监测</string>
+    <string name="notify_channel_desc">后台检测画面中的人并提示</string>
+    <string name="notify_present">检测到人 · %1$d 人</string>
+    <string name="notify_paused_detail">监控已暂停，点按恢复</string>
+    <string name="notify_running_detail">息屏也在持续监测</string>
+    <string name="notify_action_stop">停止</string>
+</resources>

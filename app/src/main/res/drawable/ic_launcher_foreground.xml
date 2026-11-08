@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 外圈「守望」环 -->
+    <path
+        android:pathData="M54,20 a34,34 0 1,1 -0.1,0"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeAlpha="0.28" />
+
+    <!-- 人形剪影 -->
+    <path
+        android:fillColor="#34C759"
+        android:pathData="M54,34 m-7.5,0 a7.5,7.5 0 1,0 15,0 a7.5,7.5 0 1,0 -15,0" />
+    <path
+        android:fillColor="#34C759"
+        android:pathData="M45,45 L63,45 A7,7 0 0,1 70,52 L70,64 A4,4 0 0,1 66,68 L64,68 L64,80 L44,80 L44,68 L42,68 A4,4 0 0,1 38,64 L38,52 A7,7 0 0,1 45,45 Z" />
+
+    <!-- 检测角标 -->
+    <path
+        android:pathData="M28,30 L28,24 L34,24"
+        android:strokeColor="#34C759"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M80,30 L80,24 L74,24"
+        android:strokeColor="#34C759"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M28,78 L28,84 L34,84"
+        android:strokeColor="#34C759"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M80,78 L80,84 L74,84"
+        android:strokeColor="#34C759"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round" />
+</vector>
